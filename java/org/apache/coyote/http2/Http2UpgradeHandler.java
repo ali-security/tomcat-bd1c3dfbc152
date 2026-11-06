@@ -1835,6 +1835,47 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
             streams.replace(original.getIdentifier(), replacement);
             original.replaceStream(replacement);
         }
+
+        Set<AbstractStream> streamsToNotify = null;
+        synchronized (this) {
+            /*
+             * If the stream being replaced is still in the backlog (usually because it has been reset) remove
+             * the stream from the backlog along with its allocation request
+             */
+            BacklogTracker tracker = backLogStreams.remove(original);
+            if (tracker != null) {
+                // Remove unallocated request from the backlog
+                backLogSize -= tracker.getRemainingReservation();
+                /*
+                 * If the stream had received an allocation but not used it, return that allocation to the
+                 * connection window. An allocation is only deducted from the connection window when the stream
+                 * uses it so the unused allocation is still part of the window. A window update does not release
+                 * the backlog while the window is greater than zero so, if other streams are waiting in the
+                 * backlog, release the whole backlog (as releaseBackLog() does when the window can satisfy it) so
+                 * those streams obtain their allocations directly from the connection window.
+                 */
+                if (tracker.getUnusedAllocation() > 0 && backLogSize > 0) {
+                    streamsToNotify = new HashSet<>(backLogStreams.keySet());
+                    backLogStreams.clear();
+                    backLogSize = 0;
+                }
+            }
+        }
+
+        if (streamsToNotify != null) {
+            for (AbstractStream stream : streamsToNotify) {
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString("upgradeHandler.releaseBacklog",
+                            connectionId, stream.getIdAsString()));
+                }
+                // There is never any O/P on stream zero (or on a stream that
+                // has already been replaced) but they may be included in the
+                // backlog as parents. Skip them if they appear here.
+                if (stream instanceof Stream) {
+                    ((Stream) stream).notifyConnection();
+                }
+            }
+        }
     }
 
 
